@@ -1,0 +1,580 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import (accuracy_score, f1_score,
+                             classification_report, confusion_matrix)
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import warnings
+warnings.filterwarnings('ignore')
+
+from google.colab import files
+uploaded = files.upload()
+
+# ═══════════════════════════════════════════════════════════════
+# 1. LOAD & CLEAN
+# ═══════════════════════════════════════════════════════════════
+print("📂 Loading epl_final.csv...")
+df = pd.read_csv('epl_final.csv')
+
+# Drop ALL post-match / during-match columns
+df = df.drop(columns=[
+    'HalfTimeResult', 'HalfTimeHomeGoals', 'HalfTimeAwayGoals',
+    'FullTimeHomeGoals', 'FullTimeAwayGoals',
+    'HomeYellowCards', 'AwayYellowCards',
+    'HomeRedCards', 'AwayRedCards'
+], errors='ignore')
+
+date_col = 'MatchDate' if 'MatchDate' in df.columns else 'Date'
+df[date_col] = pd.to_datetime(df[date_col], dayfirst=True)
+df = df.sort_values(date_col).reset_index(drop=True)
+print(f"Dataset: {len(df)} matches | {df['Season'].nunique()} seasons "
+      f"({df['Season'].min()} → {df['Season'].max()})")
+
+# ═══════════════════════════════════════════════════════════════
+# 2. ROLLING PRE-MATCH STATS
+#    Each team's avg from last 5 games BEFORE this match.
+#    Replaces raw post-match shot/corner/foul values.
+# ═══════════════════════════════════════════════════════════════
+def compute_rolling_stats(df, home_col='HomeTeam', away_col='AwayTeam', window=5):
+    defaults = {'shots': 12.0, 'sot': 4.5, 'corners': 5.0, 'fouls': 12.0}
+    team_stats = {}
+    cols = {c: [] for c in ['HomeShots', 'AwayShots', 'HomeShotsOnTarget',
+                             'AwayShotsOnTarget', 'HomeCorners', 'AwayCorners',
+                             'HomeFouls', 'AwayFouls']}
+
+    def avg(team, key):
+        h = team_stats.get(team, {}).get(key, [])
+        return np.mean(h[-window:]) if h else defaults[key]
+
+    for _, row in df.iterrows():
+        home, away = row[home_col], row[away_col]
+        cols['HomeShots'].append(avg(home, 'shots'))
+        cols['AwayShots'].append(avg(away, 'shots'))
+        cols['HomeShotsOnTarget'].append(avg(home, 'sot'))
+        cols['AwayShotsOnTarget'].append(avg(away, 'sot'))
+        cols['HomeCorners'].append(avg(home, 'corners'))
+        cols['AwayCorners'].append(avg(away, 'corners'))
+        cols['HomeFouls'].append(avg(home, 'fouls'))
+        cols['AwayFouls'].append(avg(away, 'fouls'))
+
+        for team, s, so, c, f in [
+            (home, row['HomeShots'], row['HomeShotsOnTarget'],
+             row['HomeCorners'], row['HomeFouls']),
+            (away, row['AwayShots'], row['AwayShotsOnTarget'],
+             row['AwayCorners'], row['AwayFouls'])
+        ]:
+            team_stats.setdefault(team, {'shots': [], 'sot': [], 'corners': [], 'fouls': []})
+            team_stats[team]['shots'].append(s)
+            team_stats[team]['sot'].append(so)
+            team_stats[team]['corners'].append(c)
+            team_stats[team]['fouls'].append(f)
+
+    for col, vals in cols.items():
+        df[col] = vals
+    return df, team_stats
+
+# ═══════════════════════════════════════════════════════════════
+# 3. TEAM FORM  (rolling points over last 5 games)
+# ═══════════════════════════════════════════════════════════════
+def compute_team_form(df, result_col='FullTimeResult', home_col='HomeTeam',
+                      away_col='AwayTeam', window=5):
+    home_pts = {'H': 3, 'D': 1, 'A': 0}
+    away_pts = {'H': 0, 'D': 1, 'A': 3}
+    team_form = {}
+    home_form_list, away_form_list = [], []
+
+    for _, row in df.iterrows():
+        home, away, result = row[home_col], row[away_col], row[result_col]
+        hh = team_form.get(home, [])
+        ah = team_form.get(away, [])
+        home_form_list.append(np.mean(hh[-window:]) if hh else 1.0)
+        away_form_list.append(np.mean(ah[-window:]) if ah else 1.0)
+        team_form.setdefault(home, []).append(home_pts.get(result, 1))
+        team_form.setdefault(away, []).append(away_pts.get(result, 1))
+
+    df['HomeForm'] = home_form_list
+    df['AwayForm']  = away_form_list
+    return df, team_form
+
+# ═══════════════════════════════════════════════════════════════
+# 4. ELO RATINGS — pre-gameweek freeze
+#    On days with multiple matches, all games see the same
+#    pre-day ELO (updates are buffered and applied next day).
+# ═══════════════════════════════════════════════════════════════
+def compute_elo_ratings(df, result_col='FullTimeResult', home_col='HomeTeam',
+                         away_col='AwayTeam', date_col='MatchDate',
+                         k=32, home_advantage=100, initial_elo=1500):
+    elo = {}
+    home_elo_list, away_elo_list = [], []
+    current_date  = None
+    daily_updates = {}
+
+    for _, row in df.iterrows():
+        home, away, result = row[home_col], row[away_col], row[result_col]
+        date = row[date_col]
+
+        if date != current_date:
+            for team, new_rating in daily_updates.items():
+                elo[team] = new_rating
+            daily_updates = {}
+            current_date  = date
+
+        he = elo.get(home, initial_elo)
+        ae = elo.get(away, initial_elo)
+        home_elo_list.append(he)
+        away_elo_list.append(ae)
+
+        exp_h    = 1 / (1 + 10 ** ((ae - (he + home_advantage)) / 400))
+        actual_h = 1 if result == 'H' else (0 if result == 'A' else 0.5)
+        actual_a = 1 - actual_h
+
+        daily_updates[home] = elo.get(home, initial_elo) + k * (actual_h - exp_h)
+        daily_updates[away] = elo.get(away, initial_elo) + k * (actual_a - (1 - exp_h))
+
+    for team, new_rating in daily_updates.items():
+        elo[team] = new_rating
+
+    df['HomeElo'] = home_elo_list
+    df['AwayElo'] = away_elo_list
+    df['EloDiff'] = df['HomeElo'] - df['AwayElo']
+    return df, elo
+
+# ═══════════════════════════════════════════════════════════════
+# 5. APPLY ALL FEATURE ENGINEERING
+# ═══════════════════════════════════════════════════════════════
+print("⚙️  Computing rolling pre-match stats...")
+df, team_stats_history = compute_rolling_stats(df, window=5)
+
+print("⚙️  Computing team form...")
+df, team_form_history = compute_team_form(df, window=5)
+
+print("⚙️  Computing ELO ratings (pre-gameweek)...")
+df, final_elo = compute_elo_ratings(df, date_col=date_col)
+
+# ═══════════════════════════════════════════════════════════════
+# 6. FEATURES & SEASON-BASED TEMPORAL SPLIT
+# ═══════════════════════════════════════════════════════════════
+features = [
+    'HomeShots', 'AwayShots',
+    'HomeShotsOnTarget', 'AwayShotsOnTarget',
+    'HomeCorners', 'AwayCorners',
+    'HomeFouls', 'AwayFouls',
+    'HomeForm', 'AwayForm',
+    'HomeElo', 'EloDiff'
+]
+
+X = df[features].fillna(0)
+
+seasons  = sorted(df['Season'].unique())
+split_at = int(len(seasons) * 0.8)
+train_mask = df['Season'].isin(seasons[:split_at])
+test_mask  = ~train_mask
+
+# LabelEncoder fitted on train labels only
+le = LabelEncoder()
+le.fit(df.loc[train_mask, 'FullTimeResult'])
+y_train = le.transform(df.loc[train_mask, 'FullTimeResult'])
+y_test  = le.transform(df.loc[test_mask,  'FullTimeResult'])
+
+X_train = X[train_mask].values
+X_test  = X[test_mask].values
+
+scaler         = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled  = scaler.transform(X_test)
+
+print(f"\n📊 SEASON-BASED TEMPORAL SPLIT")
+print(f"  Train : {X_train.shape[0]} matches | "
+      f"{seasons[0]} → {seasons[split_at - 1]}")
+print(f"  Test  : {X_test.shape[0]} matches  | "
+      f"{seasons[split_at]} → {seasons[-1]}")
+
+# ═══════════════════════════════════════════════════════════════
+# 7. MODELS
+# ═══════════════════════════════════════════════════════════════
+models = {
+    'Random Forest': RandomForestClassifier(
+        n_estimators=100, max_depth=8,
+        min_samples_split=20, min_samples_leaf=10,
+        max_features=0.5, random_state=42,
+        class_weight='balanced'
+    ),
+    'Logistic Regression': LogisticRegression(
+        max_iter=1000, random_state=42,
+        class_weight='balanced'
+    ),
+    'SVM': SVC(
+        kernel='rbf', random_state=42,
+        probability=True, class_weight='balanced'
+    )
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 8. TRAIN + FULL METRICS (Accuracy, F1, Classification Report)
+# ═══════════════════════════════════════════════════════════════
+print("\n" + "="*70)
+print("🎯 MODEL METRICS")
+print("="*70)
+
+results      = []
+trained_models = {}
+class_names  = le.classes_   # ['A', 'D', 'H']
+
+for name, model in models.items():
+    model.fit(X_train_scaled, y_train)
+    trained_models[name] = model
+
+    train_pred = model.predict(X_train_scaled)
+    test_pred  = model.predict(X_test_scaled)
+
+    train_acc  = accuracy_score(y_train, train_pred)
+    test_acc   = accuracy_score(y_test,  test_pred)
+    gap        = train_acc - test_acc
+
+    # F1 scores
+    f1_macro   = f1_score(y_test, test_pred, average='macro')
+    f1_weighted= f1_score(y_test, test_pred, average='weighted')
+    f1_per_cls = f1_score(y_test, test_pred, average=None)
+
+    results.append({
+        'Model':       name,
+        'Train_Acc':   train_acc,
+        'Test_Acc':    test_acc,
+        'Gap':         gap,
+        'Overfit':     'High' if gap > 0.10 else ('Low' if gap > 0.05 else 'None'),
+        'F1_Macro':    f1_macro,
+        'F1_Weighted': f1_weighted,
+        'F1_A':        f1_per_cls[0],
+        'F1_D':        f1_per_cls[1],
+        'F1_H':        f1_per_cls[2],
+    })
+
+    print(f"\n{'─'*60}")
+    print(f"  {name}")
+    print(f"{'─'*60}")
+    print(f"  Train Acc   : {train_acc:.1%}  |  Test Acc : {test_acc:.1%}  |  Gap: {gap:.1%} {'⚠️' if gap > 0.10 else '✅'}")
+    print(f"  F1 Macro    : {f1_macro:.3f}  |  F1 Weighted: {f1_weighted:.3f}")
+    print(f"  F1 per class:  Away={f1_per_cls[0]:.3f}  Draw={f1_per_cls[1]:.3f}  Home={f1_per_cls[2]:.3f}")
+    print(f"\n  Classification Report:")
+    print(classification_report(y_test, test_pred,
+                                target_names=['Away Win', 'Draw', 'Home Win'],
+                                digits=3))
+
+# ═══════════════════════════════════════════════════════════════
+# 9. K-FOLD CROSS VALIDATION (k=5, temporal — no shuffle)
+#    Uses training data only. StratifiedKFold preserves class ratio.
+#    shuffle=False respects chronological order within training set.
+# ═══════════════════════════════════════════════════════════════
+print("\n" + "="*70)
+print("🔁 5-FOLD CROSS VALIDATION (on training data, temporal order)")
+print("="*70)
+
+cv = StratifiedKFold(n_splits=5, shuffle=False)
+cv_results = {}
+
+for name, model in models.items():
+    # Accuracy CV
+    acc_scores = cross_val_score(model, X_train_scaled, y_train,
+                                 cv=cv, scoring='accuracy')
+    # F1 macro CV
+    f1_scores  = cross_val_score(model, X_train_scaled, y_train,
+                                 cv=cv, scoring='f1_macro')
+    cv_results[name] = {'acc': acc_scores, 'f1': f1_scores}
+
+    print(f"\n  {name}")
+    print(f"    Accuracy  : {acc_scores}  →  Mean: {acc_scores.mean():.3f}  Std: {acc_scores.std():.3f}")
+    print(f"    F1 Macro  : {f1_scores}   →  Mean: {f1_scores.mean():.3f}  Std: {f1_scores.std():.3f}")
+
+# ═══════════════════════════════════════════════════════════════
+# 10. SUMMARY TABLE
+# ═══════════════════════════════════════════════════════════════
+results_df = pd.DataFrame(results)
+print("\n" + "="*70)
+print("📋 FULL SUMMARY TABLE")
+print("="*70)
+display_cols = ['Model', 'Train_Acc', 'Test_Acc', 'Gap',
+                'F1_Macro', 'F1_Weighted', 'F1_A', 'F1_D', 'F1_H', 'Overfit']
+print(results_df[display_cols].round(3).to_string(index=False))
+
+best_model_name = results_df.loc[results_df['F1_Macro'].idxmax(), 'Model']
+best_model      = trained_models[best_model_name]
+best_row        = results_df.loc[results_df['F1_Macro'].idxmax()]
+print(f"\n🏆 BEST MODEL (by F1 Macro): {best_model_name}")
+print(f"   Test Acc={best_row['Test_Acc']:.1%}  F1_Macro={best_row['F1_Macro']:.3f}  "
+      f"Overfit={best_row['Overfit']}")
+
+# ═══════════════════════════════════════════════════════════════
+# 11. VISUALISATIONS
+# ═══════════════════════════════════════════════════════════════
+model_names = results_df['Model'].tolist()
+fig = plt.figure(figsize=(20, 14))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+# — Plot 1: Train vs Test Accuracy
+ax1 = fig.add_subplot(gs[0, 0])
+x   = np.arange(len(model_names))
+w   = 0.35
+ax1.bar(x - w/2, results_df['Train_Acc'], w, label='Train', alpha=0.8, color='skyblue')
+ax1.bar(x + w/2, results_df['Test_Acc'],  w, label='Test',  alpha=0.8, color='salmon')
+ax1.axhline(0.52, color='green', linestyle='--', linewidth=1, label='Baseline 52%')
+ax1.set_title('Train vs Test Accuracy')
+ax1.set_ylabel('Accuracy')
+ax1.set_xticks(x); ax1.set_xticklabels(model_names, rotation=20, ha='right')
+ax1.legend(fontsize=8); ax1.set_ylim(0, 0.85)
+
+# — Plot 2: F1 Scores per class
+ax2  = fig.add_subplot(gs[0, 1])
+x2   = np.arange(len(model_names))
+w2   = 0.25
+ax2.bar(x2 - w2,   results_df['F1_A'], w2, label='Away Win', alpha=0.8, color='coral')
+ax2.bar(x2,        results_df['F1_D'], w2, label='Draw',     alpha=0.8, color='gold')
+ax2.bar(x2 + w2,   results_df['F1_H'], w2, label='Home Win', alpha=0.8, color='steelblue')
+ax2.set_title('F1 Score per Class')
+ax2.set_ylabel('F1 Score')
+ax2.set_xticks(x2); ax2.set_xticklabels(model_names, rotation=20, ha='right')
+ax2.legend(fontsize=8); ax2.set_ylim(0, 0.85)
+
+# — Plot 3: F1 Macro vs Weighted
+ax3 = fig.add_subplot(gs[0, 2])
+ax3.bar(x - w/2, results_df['F1_Macro'],    w, label='F1 Macro',    alpha=0.8, color='mediumpurple')
+ax3.bar(x + w/2, results_df['F1_Weighted'], w, label='F1 Weighted', alpha=0.8, color='mediumseagreen')
+ax3.set_title('F1 Macro vs F1 Weighted')
+ax3.set_ylabel('F1 Score')
+ax3.set_xticks(x); ax3.set_xticklabels(model_names, rotation=20, ha='right')
+ax3.legend(fontsize=8); ax3.set_ylim(0, 0.85)
+
+# — Plots 4-6: Cross Validation Accuracy per model
+for idx, name in enumerate(model_names):
+    ax = fig.add_subplot(gs[1, idx])
+    fold_scores = cv_results[name]['acc']
+    bars = ax.bar(range(1, 6), fold_scores, color='skyblue', alpha=0.8, edgecolor='steelblue')
+    ax.axhline(fold_scores.mean(), color='red', linestyle='--', linewidth=1.5,
+               label=f'Mean={fold_scores.mean():.3f}')
+    ax.set_title(f'CV Accuracy — {name}', fontsize=10)
+    ax.set_xlabel('Fold'); ax.set_ylabel('Accuracy')
+    ax.set_xticks(range(1, 6))
+    ax.set_ylim(0.3, 0.8)
+    ax.legend(fontsize=8)
+    for bar, score in zip(bars, fold_scores):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                f'{score:.3f}', ha='center', va='bottom', fontsize=8)
+        # — Plot Confusion Matrix for best model (added at end)
+fig2, axes = plt.subplots(1, len(model_names), figsize=(18, 5))
+for ax, name in zip(axes, model_names):
+    cm = confusion_matrix(y_test, trained_models[name].predict(X_test_scaled))
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.set_title(f'Confusion Matrix\n{name}', fontsize=10)
+    ax.set_xticks([0,1,2]); ax.set_yticks([0,1,2])
+    ax.set_xticklabels(['Away', 'Draw', 'Home'], rotation=45)
+    ax.set_yticklabels(['Away', 'Draw', 'Home'])
+    ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+    for i in range(3):
+        for j in range(3):
+            ax.text(j, i, cm[i, j], ha='center', va='center',
+                    color='white' if cm[i, j] > cm.max()/2 else 'black')
+plt.tight_layout()
+plt.show()
+
+plt.suptitle('EPL Match Predictor — Full Model Evaluation', fontsize=14, fontweight='bold', y=1.01)
+# — Feature Importance (Random Forest only)
+rf_model = trained_models['Random Forest']
+importances = rf_model.feature_importances_
+indices = np.argsort(importances)[::-1]
+
+print("\n" + "="*70)
+print("📊 FEATURE IMPORTANCE (Random Forest)")
+print("="*70)
+for i, idx in enumerate(indices):
+    print(f"  {i+1:2}. {features[idx]:<25} {importances[idx]:.4f}")
+
+fig3, ax = plt.subplots(figsize=(10, 6))
+ax.bar(range(len(features)), importances[indices], color='steelblue', alpha=0.8)
+ax.set_xticks(range(len(features)))
+ax.set_xticklabels([features[i] for i in indices], rotation=45, ha='right')
+ax.set_title('Feature Importance — Random Forest')
+ax.set_ylabel('Importance')
+plt.tight_layout()
+plt.show()
+plt.show()
+print("\n💾 Saved: epl_metrics.png")
+
+# ═══════════════════════════════════════════════════════════════
+# 12. HELPER FUNCTIONS FOR UNSEEN DATA PREDICTOR
+# ═══════════════════════════════════════════════════════════════
+INITIAL_ELO = 1500
+WINDOW      = 5
+
+def get_form(team, form_history):
+    h = form_history.get(team, [])
+    return np.mean(h[-WINDOW:]) if h else 1.0
+
+def get_elo(team, elo_dict):
+    return elo_dict.get(team, INITIAL_ELO)
+
+def get_stat(team, key, stats_history):
+    defaults = {'shots': 12.0, 'sot': 4.5, 'corners': 5.0, 'fouls': 12.0}
+    h = stats_history.get(team, {}).get(key, [])
+    return np.mean(h[-WINDOW:]) if h else defaults[key]
+
+def build_feature_vector(home_team, away_team,
+                          form_history, elo_dict, stats_history,
+                          home_shots=None, away_shots=None,
+                          home_sot=None, away_sot=None,
+                          home_corners=None, away_corners=None,
+                          home_fouls=None, away_fouls=None):
+    """
+    Build feature vector for a fixture.
+    If manual stats are provided they override the rolling averages.
+    """
+    he       = get_elo(home_team, elo_dict)
+    ae       = get_elo(away_team, elo_dict)
+    elo_diff = he - ae
+
+    vec = np.array([[
+        home_shots   if home_shots   is not None else get_stat(home_team, 'shots',   stats_history),
+        away_shots   if away_shots   is not None else get_stat(away_team, 'shots',   stats_history),
+        home_sot     if home_sot     is not None else get_stat(home_team, 'sot',     stats_history),
+        away_sot     if away_sot     is not None else get_stat(away_team, 'sot',     stats_history),
+        home_corners if home_corners is not None else get_stat(home_team, 'corners', stats_history),
+        away_corners if away_corners is not None else get_stat(away_team, 'corners', stats_history),
+        home_fouls   if home_fouls   is not None else get_stat(home_team, 'fouls',   stats_history),
+        away_fouls   if away_fouls   is not None else get_stat(away_team, 'fouls',   stats_history),
+        get_form(home_team, form_history),
+        get_form(away_team, form_history),
+        he, elo_diff
+    ]])
+    return vec, he, ae
+
+def run_prediction(home_team, away_team, feature_vec, he, ae,
+                   model, scaler, label_encoder, form_history):
+    scaled     = scaler.transform(feature_vec)
+    pred_enc   = model.predict(scaled)[0]
+    pred_proba = model.predict_proba(scaled)[0]
+    pred_label = label_encoder.inverse_transform([pred_enc])[0]
+    proba_dict = {cls: prob for cls, prob in zip(label_encoder.classes_, pred_proba)}
+
+    emoji = {'H': '🏠', 'D': '🤝', 'A': '✈️'}.get(pred_label, '❓')
+    label = {'H': 'Home Win', 'D': 'Draw', 'A': 'Away Win'}.get(pred_label, pred_label)
+
+    print(f"\n  Prediction     : {emoji}  {label}")
+    print(f"  Confidence     : Away={proba_dict.get('A',0):.1%}  "
+          f"Draw={proba_dict.get('D',0):.1%}  Home={proba_dict.get('H',0):.1%}")
+    print(f"  ELO            : {home_team}={he:.0f}  {away_team}={ae:.0f}  Diff={he-ae:+.0f}")
+    print(f"  Form (avg pts) : {home_team}={get_form(home_team, form_history):.2f}  "
+          f"{away_team}={get_form(away_team, form_history):.2f}")
+
+# ═══════════════════════════════════════════════════════════════
+# 13. UPCOMING FIXTURES — AUTO MODE
+#     ELO, form, and stats pulled automatically from history.
+#     Just enter home_team and away_team.
+# ═══════════════════════════════════════════════════════════════
+print("\n" + "="*70)
+print("🔮 UPCOMING FIXTURE PREDICTIONS  (Auto — stats from history)")
+print("="*70)
+
+upcoming_fixtures = [
+    {'home_team': 'Man City',  'away_team': 'Arsenal'},
+    {'home_team': 'Liverpool', 'away_team': 'Chelsea'},
+    # Add more:
+    # {'home_team': 'Tottenham', 'away_team': 'Man United'},
+]
+
+for i, f in enumerate(upcoming_fixtures, 1):
+    print(f"\nFixture {i}: {f['home_team']} vs {f['away_team']}")
+    vec, he, ae = build_feature_vector(
+        f['home_team'], f['away_team'],
+        team_form_history, final_elo, team_stats_history
+    )
+    run_prediction(f['home_team'], f['away_team'], vec, he, ae,
+                   best_model, scaler, le, team_form_history)
+
+# ═══════════════════════════════════════════════════════════════
+# 14. UNSEEN DATA — MANUAL ENTRY MODE
+#     Enter both teams + their specific match stats manually.
+#     ELO and form are still pulled from history automatically.
+#     Use this when you have scouting data or specific estimates.
+# ═══════════════════════════════════════════════════════════════
+print("\n" + "="*70)
+print("📝 UNSEEN DATA — MANUAL FEATURE ENTRY")
+print("    (Override stats with your own estimates)")
+print("="*70)
+
+# ── ENTER YOUR MANUAL FIXTURES BELOW ──────────────────────────
+# Provide team names exactly as in epl_final.csv
+# All stat fields are optional — remove any line to use rolling avg instead
+# ──────────────────────────────────────────────────────────────
+manual_fixtures = [
+    {
+        'home_team'   : 'Man City',
+        'away_team'   : 'Arsenal',
+        # --- Home team stats (your estimates) ---
+        'home_shots'  : 16,
+        'home_sot'    : 7,
+        'home_corners': 7,
+        'home_fouls'  : 9,
+        # --- Away team stats (your estimates) ---
+        'away_shots'  : 10,
+        'away_sot'    : 4,
+        'away_corners': 4,
+        'away_fouls'  : 13,
+    },
+    {
+        'home_team'   : 'Liverpool',
+        'away_team'   : 'Chelsea',
+        'home_shots'  : 15,
+        'home_sot'    : 6,
+        'home_corners': 8,
+        'home_fouls'  : 10,
+        'away_shots'  : 9,
+        'away_sot'    : 3,
+        'away_corners': 4,
+        'away_fouls'  : 14,
+    },
+    # Add more manual fixtures:
+    # {
+    #     'home_team'   : 'Tottenham',
+    #     'away_team'   : 'Man United',
+    #     'home_shots'  : 13,
+    #     'home_sot'    : 5,
+    #     'home_corners': 6,
+    #     'home_fouls'  : 11,
+    #     'away_shots'  : 11,
+    #     'away_sot'    : 4,
+    #     'away_corners': 5,
+    #     'away_fouls'  : 12,
+    # },
+]
+
+for i, f in enumerate(manual_fixtures, 1):
+    ht, at = f['home_team'], f['away_team']
+    print(f"\nManual Fixture {i}: {ht} vs {at}")
+    print(f"  Home stats entered : Shots={f.get('home_shots','auto')}  "
+          f"SoT={f.get('home_sot','auto')}  "
+          f"Corners={f.get('home_corners','auto')}  "
+          f"Fouls={f.get('home_fouls','auto')}")
+    print(f"  Away stats entered : Shots={f.get('away_shots','auto')}  "
+          f"SoT={f.get('away_sot','auto')}  "
+          f"Corners={f.get('away_corners','auto')}  "
+          f"Fouls={f.get('away_fouls','auto')}")
+
+    vec, he, ae = build_feature_vector(
+        ht, at,
+        team_form_history, final_elo, team_stats_history,
+        home_shots   = f.get('home_shots'),
+        away_shots   = f.get('away_shots'),
+        home_sot     = f.get('home_sot'),
+        away_sot     = f.get('away_sot'),
+        home_corners = f.get('home_corners'),
+        away_corners = f.get('away_corners'),
+        home_fouls   = f.get('home_fouls'),
+        away_fouls   = f.get('away_fouls'),
+    )
+    run_prediction(ht, at, vec, he, ae,
+                   best_model, scaler, le, team_form_history)
+
+print("\n✅ Done.")
